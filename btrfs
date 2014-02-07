@@ -1,0 +1,169 @@
+# backupninja handler for incremental backups using btrfs send-receive
+# feedback: pavel.cernocky at gmail.com
+#
+#  btrfs handler is free software; you can redistribute it and/or modify it
+#  under the terms of the GNU General Public License as published by the Free
+#  Software Foundation; either version 2 of the License, or any later version.
+#
+#  btrfs handler is distributed in the hope that it will be useful, but WITHOUT
+#  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+#  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+#  more details.
+#
+#  You should have received a copy of the GNU General Public License along with
+#  this program; if not, write to the Free Software Foundation, Inc., 59 Temple
+#  Place - Suite 330, Boston, MA 02111-1307, USA
+
+
+# function definitions
+
+function eval_config {
+  debug "eval_config"
+  
+  # system section
+  setsection system
+  
+  # general section
+  setsection general
+  getconf tmp /tmp
+  
+  # source section
+  setsection source
+  getconf subvolume; src_subvolume=$subvolume
+  getconf btrfs btrfs; src_btrfs=$btrfs
+  getconf type; src_type=$type
+  if [ "$src_type" == "remote" ]; then
+    getconf testconnect yes; src_testconnect=$testconnect
+    getconf ssh ssh; src_ssh=$ssh
+    getconf host; src_host=$host
+    getconf port 22; src_port=$port
+    getconf user; src_user=$user
+    getconf ssh_options; src_ssh_options=$ssh_options
+  fi
+  
+  # dest section
+  setsection dest
+  getconf directory; dst_directory=$directory
+  getconf btrfs btrfs; dst_btrfs=$btrfs
+  getconf type; dst_type=$type
+  if [ "$dst_type" == "remote" ]; then
+    getconf testconnect yes; dst_testconnect=$testconnect
+    getconf ssh ssh; dst_ssh=$ssh
+    getconf host; dst_host=$host
+    getconf port 22; dst_port=$port
+    getconf user; dst_user=$user
+    getconf ssh_options; dst_ssh_options=$ssh_options
+  fi
+  
+  # config check
+
+  if [ "$src_type" != "local" ] && [ "$src_type" != "remote" ]; then
+    fatal "Source type should be 'local' or 'remote'"
+  fi
+
+  if [ "$dst_type" != "local" ] && [ "$dst_type" != "remote" ]; then
+    fatal "Dest type should be 'local' or 'remote'"
+  fi
+
+  check_var "src_subvolume"
+  check_var "dst_directory"
+
+  ssh_cmd_base="ssh -T -o PasswordAuthentication=no"
+  if [ "$src_type" == "remote" ]; then
+    check_var "src_user"
+    check_var "src_host"
+    src_ssh_cmd="$ssh_cmd_base -p $src_port $src_ssh_options $src_user@$src_host"
+    if [ "$src_testconnect" == "yes" ]; then
+      test_connect "$src_ssh_cmd" "$src_host" "$src_port" "$src_user"
+    fi
+  fi
+  if [ "$dst_type" == "remote" ]; then
+    check_var "dst_user"
+    check_var "dst_host"
+    dst_ssh_cmd="$ssh_cmd_base -p $dst_port $dst_ssh_options $dst_user@$dst_host"
+    if [ "$dst_testconnect" == "yes" ]; then
+      test_connect "$dst_ssh_cmd" "$dst_host" "$dst_port" "$dst_user"
+    fi
+  fi
+
+}
+
+function check_var {
+  [[ -n "${!1}" ]] || { fatal "$1 is not set" ; }
+}
+
+function test_connect {
+  local ssh_cmd="$1"
+  local host="$2"
+  local port="$3"
+  local user="$4"
+
+  debug "$ssh_cmd 'echo -n 1'"
+  result=`$ssh_cmd 'echo -n 1'`
+
+  if [ "$result" != "1" ]; then
+    fatal "Can't connect to $host:$port as $user ($ssh_cmd)."
+  else
+    debug "Connected to $host as $user successfully"
+  fi
+}
+
+# the backup procedure
+
+eval_config
+
+start_time=$(date +%s)
+
+src_last_snapshot_filename="$src_subvolume.last-snapshot-name"
+
+src_parent=$(dirname $src_subvolume)
+dir=$(basename $src_subvolume)
+dst_parent=$dst_directory
+act="$dir.$(date -d@$start_time +%F.%H-%M-%S)"
+
+src_act="$src_parent/$act"
+dst_act="$dst_parent/$act"
+
+if [ -e "$src_last_snapshot_filename" ]; then
+  prev=$($src_ssh_cmd cat "$src_last_snapshot_filename")
+  src_prev="$src_parent/$prev"
+  dst_prev="$dst_parent/$prev"
+fi
+
+debug "src_last_snapshot_filename=$src_last_snapshot_filename"
+debug "src_act=$src_act"
+debug "src_prev=$src_prev"
+debug "dst_act=$dst_act"
+debug "dst_prev=$dst_prev"
+
+info "----- $(date -d@$start_time +"%F %T") ----- Starting backup: $src_subvolume > $dst_act"
+
+# create snapshot
+$src_ssh_cmd $src_btrfs subvolume snapshot -r "$src_subvolume" "$src_act"
+$src_ssh_cmd sync
+
+# backup
+pv_err=$(mktemp)
+if [ ! -e "$src_prev" ]; then
+  info "Last snapshot filename does not exist ($src_last_snapshot_filename), doing initial backup"
+  $src_ssh_cmd $src_btrfs send "$src_act" | pv --wait --timer --rate --bytes --force 2>"$pv_err" | $dst_ssh_cmd $dst_btrfs receive "$dst_parent"
+else
+  $src_ssh_cmd $src_btrfs send -p "$src_prev" "$src_act" | pv --wait --timer --rate --bytes --force 2>"$pv_err" | $dst_ssh_cmd $dst_btrfs receive "$dst_parent"
+fi
+
+if [ $? -ne 0 ]; then
+  fatal "Backup failed"
+fi
+
+info $(cat "$pv_err")
+rm "$pv_err"
+
+if [ -z "$src_ssh_cmd" ]; then
+  $src_ssh_cmd echo "$act" > "$src_last_snapshot_filename"
+else
+  $src_ssh_cmd "echo $act > $src_last_snapshot_filename"
+fi
+
+end_time=$(date +%s)
+elapsed=$(( $end_time - $start_time ))
+info "----- $(date -d@$end_time +"%F %T") ----- Finished successfuly, elapsed $(date --utc -d@$elapsed +%T)"
